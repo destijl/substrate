@@ -184,6 +184,118 @@ func TestClientDialContextHTTP2(t *testing.T) {
 	}
 }
 
+func withConnectHeaders(fn func() (http.Header, error)) clientOption {
+	return func(c *Client) {
+		c.getConnectHeaders = fn
+	}
+}
+
+func TestClientDialContextInjectsConnectHeadersHTTP1(t *testing.T) {
+	ca := newTestCA(t)
+	request := make(chan *http.Request, 1)
+	gatewayAddress := serveTestConnectGateway(t, ca, func(conn net.Conn, req *http.Request) {
+		request <- req
+		_, _ = io.WriteString(conn, "HTTP/1.1 200 Connection Established\r\n\r\n")
+	})
+	client := newTestClient(t, ca,
+		withDialer(dialFixedAddress(gatewayAddress)),
+		withConnectHeaders(func() (http.Header, error) {
+			return http.Header{
+				"Workload-Access-Token": []string{"test-token-h1"},
+				"X-Custom-Header":       []string{"custom-h1"},
+			}, nil
+		}),
+	)
+
+	conn, err := client.DialContext(context.Background(), "192.0.2.10:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	gotReq := receiveWithin(t, request, "H1 CONNECT request")
+	if got := gotReq.Header.Get("Workload-Access-Token"); got != "test-token-h1" {
+		t.Errorf("Workload-Access-Token = %q, want test-token-h1", got)
+	}
+	if got := gotReq.Header.Get("X-Custom-Header"); got != "custom-h1" {
+		t.Errorf("X-Custom-Header = %q, want custom-h1", got)
+	}
+}
+
+func TestClientDialContextInjectsConnectHeadersHTTP2(t *testing.T) {
+	ca := newTestCA(t)
+	request := make(chan *http.Request, 1)
+	gatewayAddress, _ := serveTestH2ConnectGateway(t, ca, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		request <- r
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Error("ResponseWriter does not implement http.Flusher")
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		flusher.Flush()
+	}))
+	client := newTestClient(t, ca,
+		withDialer(dialFixedAddress(gatewayAddress)),
+		withConnectHeaders(func() (http.Header, error) {
+			return http.Header{
+				"Workload-Access-Token": []string{"test-token-h2"},
+				"X-Custom-Header":       []string{"custom-h2"},
+			}, nil
+		}),
+	)
+
+	conn, err := client.DialContext(context.Background(), "192.0.2.10:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	gotReq := receiveWithin(t, request, "H2 CONNECT request")
+	if got := gotReq.Header.Get("Workload-Access-Token"); got != "test-token-h2" {
+		t.Errorf("Workload-Access-Token = %q, want test-token-h2", got)
+	}
+	if got := gotReq.Header.Get("X-Custom-Header"); got != "custom-h2" {
+		t.Errorf("X-Custom-Header = %q, want custom-h2", got)
+	}
+}
+
+func TestClientDialContextGetConnectHeadersErrorFailsClosedHTTP1(t *testing.T) {
+	ca := newTestCA(t)
+	gatewayAddress := serveTestConnectGateway(t, ca, func(conn net.Conn, req *http.Request) {
+		_, _ = io.WriteString(conn, "HTTP/1.1 200 Connection Established\r\n\r\n")
+	})
+	client := newTestClient(t, ca,
+		withDialer(dialFixedAddress(gatewayAddress)),
+		withConnectHeaders(func() (http.Header, error) {
+			return nil, errors.New("simulated headers failure")
+		}),
+	)
+
+	_, err := client.DialContext(context.Background(), "192.0.2.10:443")
+	if err == nil || !strings.Contains(err.Error(), "get connect headers") {
+		t.Fatalf("DialContext() err = %v, want get connect headers error", err)
+	}
+}
+
+func TestClientDialContextGetConnectHeadersErrorFailsClosedHTTP2(t *testing.T) {
+	ca := newTestCA(t)
+	gatewayAddress, _ := serveTestH2ConnectGateway(t, ca, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	client := newTestClient(t, ca,
+		withDialer(dialFixedAddress(gatewayAddress)),
+		withConnectHeaders(func() (http.Header, error) {
+			return nil, errors.New("simulated headers failure")
+		}),
+	)
+
+	_, err := client.DialContext(context.Background(), "192.0.2.10:443")
+	if err == nil || !strings.Contains(err.Error(), "get connect headers") {
+		t.Fatalf("DialContext() err = %v, want get connect headers error", err)
+	}
+}
+
 func TestClientDialContextHTTP2MultiplexesStreams(t *testing.T) {
 	ca := newTestCA(t)
 	const streamCount = 4
@@ -686,6 +798,9 @@ func serveTestConnectGateway(t *testing.T, ca *testCA, handle func(net.Conn, *ht
 		}
 		req, err := http.ReadRequest(bufio.NewReader(conn))
 		if err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				return
+			}
 			t.Errorf("reading CONNECT request: %v", err)
 			return
 		}

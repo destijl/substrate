@@ -31,6 +31,7 @@ import (
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"github.com/agent-substrate/substrate/pkg/proto/ateconfigpb"
 	"github.com/agent-substrate/substrate/pkg/proto/credproviderpb"
+	egresscredentialv1 "github.com/agent-substrate/substrate/pkg/proto/egresscredentialpb/v1"
 	objectstorev1 "github.com/agent-substrate/substrate/pkg/proto/objectstorepb/v1"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protodesc"
@@ -386,6 +387,7 @@ var ourProtoFiles = []protoreflect.FileDescriptor{
 	glutton.File_glutton_proto,
 	grpcechopb.File_grpcecho_proto,
 	objectstorev1.File_objectstore_proto,
+	egresscredentialv1.File_egresscredential_proto,
 }
 
 // forEachField calls fn for every field of every message in ourProtoFiles,
@@ -417,16 +419,19 @@ func isDebugRedact(fd protoreflect.FieldDescriptor) bool {
 // change is reviewed as a deliberate decision about what the logs may show.
 func TestDebugRedactFieldsArePinned(t *testing.T) {
 	want := map[string]bool{
-		"ateapi.EnvVar.value":                            true,
-		"ateapi.MintActorJwtResponse.actor_jwt":          true,
-		"ateapi.MintWorkerActorJwtResponse.actor_jwt":    true,
-		"atelet.AssetFile.url":                           true,
-		"atelet.EnvEntry.value":                          true,
-		"ateworker.ContainerSpec.env":                    true,
-		"credprovider.FetchSecretResponse.opaque_bytes":  true,
-		"objectstore.v1.FetchAssetRequest.asset_uri":     true,
-		"objectstore.v1.FetchSnapshotRequest.actor_jwt":  true,
-		"objectstore.v1.UploadSnapshotRequest.actor_jwt": true,
+		"ateapi.EnvVar.value":                                            true,
+		"ateapi.MintActorJwtResponse.actor_jwt":                          true,
+		"ateapi.MintWorkerActorJwtResponse.actor_jwt":                    true,
+		"atelet.AssetFile.url":                                           true,
+		"atelet.EnvEntry.value":                                          true,
+		"atelet.MintActorCertificateResponse.connect_headers":            true,
+		"ateworker.ContainerSpec.env":                                    true,
+		"credprovider.FetchSecretResponse.opaque_bytes":                  true,
+		"egresscredential.v1.MintConnectHeadersRequest.actor_jwt":        true,
+		"egresscredential.v1.MintConnectHeadersResponse.connect_headers": true,
+		"objectstore.v1.FetchAssetRequest.asset_uri":                     true,
+		"objectstore.v1.FetchSnapshotRequest.actor_jwt":                  true,
+		"objectstore.v1.UploadSnapshotRequest.actor_jwt":                 true,
 	}
 	got := map[string]bool{}
 	forEachField(func(fd protoreflect.FieldDescriptor) {
@@ -455,10 +460,11 @@ var secretLikeName = regexp.MustCompile(`(?i)jwt|token|secret|passw|credential|p
 // credential goes in notSecret with the reason.
 func TestSecretLikeFieldsAreLabeled(t *testing.T) {
 	notSecret := map[string]string{
-		"page_token":                             "opaque list cursor",
-		"next_page_token":                        "opaque list cursor",
-		"ateapi.CredentialHeader.credential_uri": "ate-secret:// reference to a credential, not the value",
-		"ateapi.CredentialHeader.actor_jwt":      "ActorJwtSource: audiences and lifetime for minting, not a token",
+		"page_token":                                          "opaque list cursor",
+		"next_page_token":                                     "opaque list cursor",
+		"ateapi.CredentialHeader.credential_uri":              "ate-secret:// reference to a credential, not the value",
+		"ateapi.CredentialHeader.actor_jwt":                   "ActorJwtSource: audiences and lifetime for minting, not a token",
+		"egresscredential.v1.GetConfigResponse.jwt_audiences": "target audience URIs for minting, not a token",
 	}
 	forEachField(func(fd protoreflect.FieldDescriptor) {
 		if !secretLikeName.MatchString(string(fd.Name())) || isDebugRedact(fd) {

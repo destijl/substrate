@@ -21,7 +21,10 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
+	"maps"
+	"net/http"
 	"slices"
 	"sync"
 	"time"
@@ -42,8 +45,9 @@ type BrokerCertificateSource struct {
 	tlsConfig  *tls.Config
 	privateKey *ecdsa.PrivateKey
 
-	mu          sync.RWMutex
-	certificate *tls.Certificate
+	mu             sync.RWMutex
+	certificate    *tls.Certificate
+	connectHeaders map[string]string
 }
 
 // BrokerConfig configures the node-local atelet credential broker client.
@@ -150,11 +154,24 @@ func (s *BrokerCertificateSource) MintWorkerCertificate(ctx context.Context) (ti
 	if !slices.Contains(leaf.ExtKeyUsage, x509.ExtKeyUsageClientAuth) {
 		return time.Time{}, fmt.Errorf("egress: actor certificate cannot authenticate a TLS client")
 	}
+
+	expiresAt := leaf.NotAfter
+	if expSec := resp.GetConnectHeadersExpiresAtUnixSec(); expSec > 0 {
+		hdrExp := time.Unix(expSec, 0)
+		if !now.Before(hdrExp) {
+			return time.Time{}, fmt.Errorf("egress: connect headers are already expired")
+		}
+		if hdrExp.Before(expiresAt) {
+			expiresAt = hdrExp
+		}
+	}
+
 	cert := &tls.Certificate{Certificate: chain, PrivateKey: s.privateKey, Leaf: leaf}
 	s.mu.Lock()
 	s.certificate = cert
+	s.connectHeaders = maps.Clone(resp.GetConnectHeaders())
 	s.mu.Unlock()
-	return leaf.NotAfter, nil
+	return expiresAt, nil
 }
 
 // GetClientCertificate supplies the current actor certificate to the egress
@@ -166,4 +183,21 @@ func (s *BrokerCertificateSource) GetClientCertificate(*tls.CertificateRequestIn
 		return nil, fmt.Errorf("egress: no valid actor certificate")
 	}
 	return s.certificate, nil
+}
+
+// GetConnectHeaders returns the HTTP headers to attach to egress CONNECT requests.
+func (s *BrokerCertificateSource) GetConnectHeaders() (http.Header, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.certificate == nil {
+		return nil, errors.New("actor certificate has not been minted")
+	}
+	if len(s.connectHeaders) == 0 {
+		return nil, nil
+	}
+	hdr := make(http.Header, len(s.connectHeaders))
+	for k, v := range s.connectHeaders {
+		hdr.Set(k, v)
+	}
+	return hdr, nil
 }

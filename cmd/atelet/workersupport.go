@@ -21,10 +21,12 @@ import (
 	"log/slog"
 
 	"github.com/agent-substrate/substrate/cmd/atelet/internal/apivalidation"
+	"github.com/agent-substrate/substrate/internal/pluginsocket"
 	"github.com/agent-substrate/substrate/internal/proto/ateletpb"
 	"github.com/agent-substrate/substrate/internal/resources"
 	"github.com/agent-substrate/substrate/internal/substratex509"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	egresscredentialv1 "github.com/agent-substrate/substrate/pkg/proto/egresscredentialpb/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/peer"
@@ -33,8 +35,9 @@ import (
 
 type workerSupportServer struct {
 	ateletpb.UnimplementedWorkerSupportServer
-	workers ateapipb.WorkerServiceClient
-	control ateapipb.ControlClient
+	workers          ateapipb.WorkerServiceClient
+	control          ateapipb.ControlClient
+	egressCredPlugin egresscredentialv1.NodeProviderClient
 }
 
 func (b *workerSupportServer) MintActorCertificate(ctx context.Context, req *ateletpb.MintActorCertificateRequest) (*ateletpb.MintActorCertificateResponse, error) {
@@ -65,7 +68,44 @@ func (b *workerSupportServer) MintActorCertificate(ctx context.Context, req *ate
 	if err != nil {
 		return nil, fmt.Errorf("mint actor certificate: %w", err)
 	}
-	return &ateletpb.MintActorCertificateResponse{ActorCertificates: resp.GetActorCertificates()}, nil
+
+	out := &ateletpb.MintActorCertificateResponse{
+		ActorCertificates: resp.GetActorCertificates(),
+	}
+	if b.egressCredPlugin != nil {
+		cfgResp, err := b.egressCredPlugin.GetConfig(ctx, &egresscredentialv1.GetConfigRequest{})
+		if err != nil {
+			return nil, pluginsocket.CallError(err)
+		}
+		var actorJWT string
+		if len(cfgResp.GetJwtAudiences()) > 0 {
+			jwtResp, err := b.workers.MintWorkerActorJwt(ctx, &ateapipb.MintWorkerActorJwtRequest{
+				Actor: &ateapipb.ObjectRef{
+					Atespace: req.GetActorAtespace(),
+					Name:     req.GetActorName(),
+				},
+				ActorUid:  req.GetActorUid(),
+				Audiences: cfgResp.GetJwtAudiences(),
+			})
+			if err != nil {
+				return nil, fmt.Errorf("mint actor JWT: %w", err)
+			}
+			actorJWT = jwtResp.GetActorJwt()
+		}
+		hdrResp, err := b.egressCredPlugin.MintConnectHeaders(ctx, &egresscredentialv1.MintConnectHeadersRequest{
+			ActorAtespace:     req.GetActorAtespace(),
+			ActorName:         req.GetActorName(),
+			ActorUid:          req.GetActorUid(),
+			ActorJwt:          actorJWT,
+			ActorCertificates: resp.GetActorCertificates(),
+		})
+		if err != nil {
+			return nil, pluginsocket.CallError(err)
+		}
+		out.ConnectHeaders = hdrResp.GetConnectHeaders()
+		out.ConnectHeadersExpiresAtUnixSec = hdrResp.GetExpiresAtUnixSec()
+	}
+	return out, nil
 }
 
 func authenticatedWorkerIdentity(ctx context.Context) (*substratex509.PodIdentity, error) {

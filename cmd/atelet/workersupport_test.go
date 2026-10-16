@@ -29,6 +29,7 @@ import (
 	"github.com/agent-substrate/substrate/internal/resources"
 	"github.com/agent-substrate/substrate/internal/substratex509"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	egresscredentialv1 "github.com/agent-substrate/substrate/pkg/proto/egresscredentialpb/v1"
 	"github.com/google/go-cmp/cmp"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -91,6 +92,9 @@ type fakeWorkerService struct {
 	got      []*ateapipb.RegisterWorkerRequest
 	mintGot  []*ateapipb.MintWorkerActorCertificateRequest
 	mintResp *ateapipb.MintWorkerActorCertificateResponse
+	jwtGot   []*ateapipb.MintWorkerActorJwtRequest
+	jwtResp  *ateapipb.MintWorkerActorJwtResponse
+	jwtErr   error
 	err      error
 }
 
@@ -111,6 +115,48 @@ func (s *fakeWorkerService) MintWorkerActorCertificate(_ context.Context, in *at
 		return s.mintResp, nil
 	}
 	return &ateapipb.MintWorkerActorCertificateResponse{}, nil
+}
+
+func (s *fakeWorkerService) MintWorkerActorJwt(_ context.Context, in *ateapipb.MintWorkerActorJwtRequest, _ ...grpc.CallOption) (*ateapipb.MintWorkerActorJwtResponse, error) {
+	if s.jwtErr != nil {
+		return nil, s.jwtErr
+	}
+	s.jwtGot = append(s.jwtGot, in)
+	if s.jwtResp != nil {
+		return s.jwtResp, nil
+	}
+	return &ateapipb.MintWorkerActorJwtResponse{}, nil
+}
+
+type fakeEgressCredPlugin struct {
+	egresscredentialv1.NodeProviderClient
+
+	cfgResp  *egresscredentialv1.GetConfigResponse
+	cfgErr   error
+	mintGot  []*egresscredentialv1.MintConnectHeadersRequest
+	mintResp *egresscredentialv1.MintConnectHeadersResponse
+	mintErr  error
+}
+
+func (p *fakeEgressCredPlugin) GetConfig(_ context.Context, _ *egresscredentialv1.GetConfigRequest, _ ...grpc.CallOption) (*egresscredentialv1.GetConfigResponse, error) {
+	if p.cfgErr != nil {
+		return nil, p.cfgErr
+	}
+	if p.cfgResp != nil {
+		return p.cfgResp, nil
+	}
+	return &egresscredentialv1.GetConfigResponse{}, nil
+}
+
+func (p *fakeEgressCredPlugin) MintConnectHeaders(_ context.Context, in *egresscredentialv1.MintConnectHeadersRequest, _ ...grpc.CallOption) (*egresscredentialv1.MintConnectHeadersResponse, error) {
+	if p.mintErr != nil {
+		return nil, p.mintErr
+	}
+	p.mintGot = append(p.mintGot, in)
+	if p.mintResp != nil {
+		return p.mintResp, nil
+	}
+	return &egresscredentialv1.MintConnectHeadersResponse{}, nil
 }
 
 func TestRegisterWorker(t *testing.T) {
@@ -366,6 +412,163 @@ func TestMintActorCertificateRequiresCertificate(t *testing.T) {
 	if len(workers.mintGot) != 0 {
 		t.Errorf("unauthenticated request still forwarded %v", workers.mintGot)
 	}
+}
+
+func TestMintActorCertificateWithEgressCredentialPlugin(t *testing.T) {
+	wantCerts := [][]byte{[]byte("cert-der-bytes")}
+	req := &ateletpb.MintActorCertificateRequest{
+		ActorAtespace:             "team-a",
+		ActorName:                 "actor-1",
+		ActorUid:                  "01234567-89ab-cdef-0123-456789abcdef",
+		CertificateSigningRequest: []byte("csr-bytes"),
+	}
+
+	t.Run("successful flow with audiences", func(t *testing.T) {
+		workers := &fakeWorkerService{
+			mintResp: &ateapipb.MintWorkerActorCertificateResponse{
+				ActorCertificates: wantCerts,
+			},
+			jwtResp: &ateapipb.MintWorkerActorJwtResponse{
+				ActorJwt: "jwt-token-xyz",
+			},
+		}
+		plugin := &fakeEgressCredPlugin{
+			cfgResp: &egresscredentialv1.GetConfigResponse{
+				JwtAudiences: []string{"audience-1"},
+			},
+			mintResp: &egresscredentialv1.MintConnectHeadersResponse{
+				ConnectHeaders:   map[string]string{"Workload-Access-Token": "token-123"},
+				ExpiresAtUnixSec: 1700000000,
+			},
+		}
+		svc := &workerSupportServer{workers: workers, egressCredPlugin: plugin}
+
+		ctx := workerContext(t, "pod-a")
+		resp, err := svc.MintActorCertificate(ctx, req)
+		if err != nil {
+			t.Fatalf("MintActorCertificate() failed: %v", err)
+		}
+
+		if len(workers.jwtGot) != 1 {
+			t.Fatalf("MintWorkerActorJwt calls = %d, want 1", len(workers.jwtGot))
+		}
+		if workers.jwtGot[0].GetActor().GetAtespace() != "team-a" || workers.jwtGot[0].GetActor().GetName() != "actor-1" {
+			t.Errorf("minted JWT for unexpected actor: %v", workers.jwtGot[0].GetActor())
+		}
+		if diff := cmp.Diff([]string{"audience-1"}, workers.jwtGot[0].GetAudiences()); diff != "" {
+			t.Errorf("audiences mismatch (-want +got):\n%s", diff)
+		}
+
+		if len(plugin.mintGot) != 1 {
+			t.Fatalf("MintConnectHeaders calls = %d, want 1", len(plugin.mintGot))
+		}
+		if plugin.mintGot[0].GetActorJwt() != "jwt-token-xyz" {
+			t.Errorf("MintConnectHeaders actor_jwt = %q, want %q", plugin.mintGot[0].GetActorJwt(), "jwt-token-xyz")
+		}
+		if diff := cmp.Diff(wantCerts, plugin.mintGot[0].GetActorCertificates()); diff != "" {
+			t.Errorf("MintConnectHeaders actor certificates mismatch (-want +got):\n%s", diff)
+		}
+
+		if diff := cmp.Diff(wantCerts, resp.GetActorCertificates()); diff != "" {
+			t.Errorf("actor certificates mismatch (-want +got):\n%s", diff)
+		}
+		if diff := cmp.Diff(map[string]string{"Workload-Access-Token": "token-123"}, resp.GetConnectHeaders()); diff != "" {
+			t.Errorf("connect headers mismatch (-want +got):\n%s", diff)
+		}
+		if resp.GetConnectHeadersExpiresAtUnixSec() != 1700000000 {
+			t.Errorf("expires_at = %d, want 1700000000", resp.GetConnectHeadersExpiresAtUnixSec())
+		}
+	})
+
+	t.Run("successful flow without audiences", func(t *testing.T) {
+		workers := &fakeWorkerService{
+			mintResp: &ateapipb.MintWorkerActorCertificateResponse{
+				ActorCertificates: wantCerts,
+			},
+		}
+		plugin := &fakeEgressCredPlugin{
+			cfgResp: &egresscredentialv1.GetConfigResponse{
+				JwtAudiences: nil,
+			},
+			mintResp: &egresscredentialv1.MintConnectHeadersResponse{
+				ConnectHeaders:   map[string]string{"Header": "val"},
+				ExpiresAtUnixSec: 1800000000,
+			},
+		}
+		svc := &workerSupportServer{workers: workers, egressCredPlugin: plugin}
+
+		ctx := workerContext(t, "pod-a")
+		resp, err := svc.MintActorCertificate(ctx, req)
+		if err != nil {
+			t.Fatalf("MintActorCertificate() failed: %v", err)
+		}
+		if len(workers.jwtGot) != 0 {
+			t.Errorf("MintWorkerActorJwt called when audiences were empty")
+		}
+		if len(plugin.mintGot) != 1 || plugin.mintGot[0].GetActorJwt() != "" {
+			t.Errorf("MintConnectHeaders actor_jwt = %q, want empty", plugin.mintGot[0].GetActorJwt())
+		}
+		if resp.GetConnectHeaders()["Header"] != "val" {
+			t.Errorf("connect header = %q, want %q", resp.GetConnectHeaders()["Header"], "val")
+		}
+	})
+
+	t.Run("GetConfig error", func(t *testing.T) {
+		workers := &fakeWorkerService{
+			mintResp: &ateapipb.MintWorkerActorCertificateResponse{
+				ActorCertificates: wantCerts,
+			},
+		}
+		plugin := &fakeEgressCredPlugin{
+			cfgErr: status.Error(codes.Unavailable, "plugin unreachable"),
+		}
+		svc := &workerSupportServer{workers: workers, egressCredPlugin: plugin}
+
+		ctx := workerContext(t, "pod-a")
+		_, err := svc.MintActorCertificate(ctx, req)
+		if status.Code(err) != codes.Unavailable {
+			t.Errorf("code = %v, want Unavailable", status.Code(err))
+		}
+	})
+
+	t.Run("MintWorkerActorJwt error", func(t *testing.T) {
+		workers := &fakeWorkerService{
+			mintResp: &ateapipb.MintWorkerActorCertificateResponse{
+				ActorCertificates: wantCerts,
+			},
+			jwtErr: status.Error(codes.PermissionDenied, "cannot mint jwt"),
+		}
+		plugin := &fakeEgressCredPlugin{
+			cfgResp: &egresscredentialv1.GetConfigResponse{
+				JwtAudiences: []string{"aud"},
+			},
+		}
+		svc := &workerSupportServer{workers: workers, egressCredPlugin: plugin}
+
+		ctx := workerContext(t, "pod-a")
+		_, err := svc.MintActorCertificate(ctx, req)
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+	})
+
+	t.Run("MintConnectHeaders error", func(t *testing.T) {
+		workers := &fakeWorkerService{
+			mintResp: &ateapipb.MintWorkerActorCertificateResponse{
+				ActorCertificates: wantCerts,
+			},
+		}
+		plugin := &fakeEgressCredPlugin{
+			mintErr: status.Error(codes.Internal, "sts failed"),
+		}
+		svc := &workerSupportServer{workers: workers, egressCredPlugin: plugin}
+
+		ctx := workerContext(t, "pod-a")
+		_, err := svc.MintActorCertificate(ctx, req)
+		if status.Code(err) != codes.Internal {
+			t.Errorf("code = %v, want Internal", status.Code(err))
+		}
+	})
 }
 
 type fakeEgressPolicyControl struct {

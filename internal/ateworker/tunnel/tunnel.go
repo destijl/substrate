@@ -228,6 +228,7 @@ func (t *Tunnel) PrepareEgress(ctx context.Context, actor resources.ActorAttribu
 		GatewayAddress:       gateway.GetAddress(),
 		ServerName:           serverName,
 		GetClientCertificate: certificateSource.GetClientCertificate,
+		GetConnectHeaders:    certificateSource.GetConnectHeaders,
 		TrustBundlePath:      t.cfg.EgressTrustBundle,
 	})
 	if err != nil {

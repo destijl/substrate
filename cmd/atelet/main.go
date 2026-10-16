@@ -62,6 +62,7 @@ import (
 	"github.com/agent-substrate/substrate/pkg/client/informers/externalversions"
 	"github.com/agent-substrate/substrate/pkg/objectstorage"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	egresscredentialv1 "github.com/agent-substrate/substrate/pkg/proto/egresscredentialpb/v1"
 	objectstorev1 "github.com/agent-substrate/substrate/pkg/proto/objectstorepb/v1"
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/spf13/pflag"
@@ -120,7 +121,8 @@ var (
 	drainDelay   = pflag.Duration("drain-delay", 0, "How long to keep accepting new RPCs after SIGTERM before starting the gRPC drain.")
 	drainTimeout = pflag.Duration("drain-timeout", 5*time.Minute, "Deadline for the graceful gRPC drain on shutdown. In-flight RPCs still running past it are forcefully cancelled.")
 
-	objectStorePluginSocket = pflag.String("objectstore-plugin-socket", "/run/objectstore-plugin/node.sock", "Unix socket of the node object-store plugin that external snapshots are fetched and uploaded through, and every sandbox asset is fetched through. A gs:// asset the plugin cannot serve is then read anonymously.")
+	objectStorePluginSocket      = pflag.String("objectstore-plugin-socket", "/run/objectstore-plugin/node.sock", "Unix socket of the node object-store plugin that external snapshots are fetched and uploaded through, and every sandbox asset is fetched through. A gs:// asset the plugin cannot serve is then read anonymously.")
+	egressCredentialPluginSocket = pflag.String("egress-credential-plugin-socket", "", "Unix socket of the node egress-credential plugin that supplies HTTP CONNECT headers alongside actor egress certificates. Empty disables the plugin.")
 )
 
 var _ imagecache.CandidateKeychain = (*credentialprovider.Keychain)(nil)
@@ -423,11 +425,28 @@ func main() {
 		serverboot.Fatal(ctx, "Failed to restrict credential broker socket", err)
 	}
 
+	var egressCredPlugin egresscredentialv1.NodeProviderClient
+	if *egressCredentialPluginSocket != "" {
+		egressCredPluginConn, err := pluginsocket.Dial(*egressCredentialPluginSocket, pluginsocket.ReadyWait)
+		if err != nil {
+			serverboot.Fatal(ctx, "Failed to set up the egress-credential plugin client", err)
+		}
+		defer egressCredPluginConn.Close()
+		readyCtx, cancelReady := context.WithTimeout(ctx, time.Minute)
+		err = pluginsocket.WaitReady(readyCtx, egressCredPluginConn)
+		cancelReady()
+		if err != nil {
+			serverboot.Fatal(ctx, "Egress-credential plugin is not serving", err)
+		}
+		egressCredPlugin = egresscredentialv1.NewNodeProviderClient(egressCredPluginConn)
+	}
+
 	workerFacingSrv := grpc.NewServer(grpc.Creds(credentials.NewTLS(workerFacingTLS)))
 
 	ateletpb.RegisterWorkerSupportServer(workerFacingSrv, &workerSupportServer{
-		workers: ateapipb.NewWorkerServiceClient(ateapiConn),
-		control: ateapipb.NewControlClient(ateapiConn),
+		workers:          ateapipb.NewWorkerServiceClient(ateapiConn),
+		control:          ateapipb.NewControlClient(ateapiConn),
+		egressCredPlugin: egressCredPlugin,
 	})
 	go func() {
 		if err := workerFacingSrv.Serve(workerFacingLis); err != nil {

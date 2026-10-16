@@ -83,11 +83,86 @@ func TestBrokerCertificateSourceRejectsExpiredCertificate(t *testing.T) {
 	}
 }
 
+func TestBrokerCertificateSourceGetConnectHeaders(t *testing.T) {
+	source, broker := newTestBrokerCertificateSource(t, testAteletIdentity("node-a"), time.Hour)
+
+	// Before minting, GetConnectHeaders must return an error.
+	if _, err := source.GetConnectHeaders(); err == nil || !strings.Contains(err.Error(), "not been minted") {
+		t.Fatalf("GetConnectHeaders() before mint error = %v, want not minted", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	broker.connectHeaders = map[string]string{
+		"Workload-Access-Token": "test-access-token",
+		"X-Custom-Header":       "custom-value",
+	}
+	if _, err := source.MintWorkerCertificate(ctx); err != nil {
+		t.Fatalf("MintWorkerCertificate() error = %v", err)
+	}
+
+	hdrs, err := source.GetConnectHeaders()
+	if err != nil {
+		t.Fatalf("GetConnectHeaders() error = %v", err)
+	}
+	if got := hdrs.Get("Workload-Access-Token"); got != "test-access-token" {
+		t.Errorf("Workload-Access-Token = %q, want test-access-token", got)
+	}
+	if got := hdrs.Get("X-Custom-Header"); got != "custom-value" {
+		t.Errorf("X-Custom-Header = %q, want custom-value", got)
+	}
+}
+
+func TestBrokerCertificateSourceConnectHeadersExpiry(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	t.Run("headers expire before certificate", func(t *testing.T) {
+		source, broker := newTestBrokerCertificateSource(t, testAteletIdentity("node-a"), time.Hour)
+		headerExp := time.Now().Add(10 * time.Minute).Unix()
+		broker.headersExpiry = headerExp
+		expiresAt, err := source.MintWorkerCertificate(ctx)
+		if err != nil {
+			t.Fatalf("MintWorkerCertificate() error = %v", err)
+		}
+		if expiresAt.Unix() != headerExp {
+			t.Errorf("expiresAt = %v, want %v", expiresAt.Unix(), headerExp)
+		}
+	})
+
+	t.Run("certificate expires before headers", func(t *testing.T) {
+		source, broker := newTestBrokerCertificateSource(t, testAteletIdentity("node-a"), 10*time.Minute)
+		broker.headersExpiry = time.Now().Add(time.Hour).Unix()
+		expiresAt, err := source.MintWorkerCertificate(ctx)
+		if err != nil {
+			t.Fatalf("MintWorkerCertificate() error = %v", err)
+		}
+		cert, err := source.GetClientCertificate(nil)
+		if err != nil {
+			t.Fatalf("GetClientCertificate() error = %v", err)
+		}
+		if !expiresAt.Equal(cert.Leaf.NotAfter) {
+			t.Errorf("expiresAt = %v, want cert NotAfter %v", expiresAt, cert.Leaf.NotAfter)
+		}
+	})
+
+	t.Run("headers already expired", func(t *testing.T) {
+		source, broker := newTestBrokerCertificateSource(t, testAteletIdentity("node-a"), time.Hour)
+		broker.headersExpiry = time.Now().Add(-time.Minute).Unix()
+		if _, err := source.MintWorkerCertificate(ctx); err == nil || !strings.Contains(err.Error(), "connect headers are already expired") {
+			t.Fatalf("MintWorkerCertificate() error = %v, want expired connect headers", err)
+		}
+	})
+}
+
 type workerSupportStub struct {
 	ateletpb.UnimplementedWorkerSupportServer
-	ca         *testCA
-	lifetime   time.Duration
-	publicKeys chan []byte
+	ca             *testCA
+	lifetime       time.Duration
+	publicKeys     chan []byte
+	connectHeaders map[string]string
+	headersExpiry  int64
 }
 
 func (s *workerSupportStub) MintActorCertificate(_ context.Context, req *ateletpb.MintActorCertificateRequest) (*ateletpb.MintActorCertificateResponse, error) {
@@ -117,7 +192,11 @@ func (s *workerSupportStub) MintActorCertificate(_ context.Context, req *ateletp
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 	s.publicKeys <- csr.RawSubjectPublicKeyInfo
-	return &ateletpb.MintActorCertificateResponse{ActorCertificates: [][]byte{der}}, nil
+	return &ateletpb.MintActorCertificateResponse{
+		ActorCertificates:              [][]byte{der},
+		ConnectHeaders:                 s.connectHeaders,
+		ConnectHeadersExpiresAtUnixSec: s.headersExpiry,
+	}, nil
 }
 
 func newTestBrokerCertificateSource(t *testing.T, ateletIdentity *substratex509.PodIdentity, lifetime time.Duration) (*BrokerCertificateSource, *workerSupportStub) {

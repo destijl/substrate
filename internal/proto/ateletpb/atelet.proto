@@ -305,6 +305,12 @@ message MintActorCertificateRequest {
 message MintActorCertificateResponse {
   // DER-encoded leaf followed by any intermediate certificates.
   repeated bytes actor_certificates = 1;
+
+  // Optional HTTP headers that atunnel attaches to outer HTTP CONNECT requests.
+  map<string, string> connect_headers = 2 [ debug_redact = true ];
+
+  // Optional Unix timestamp (in seconds) when connect_headers expire.
+  int64 connect_headers_expires_at_unix_sec = 3;
 }
 
 // Atelet allows ate-apiserver to issue control calls to the atelet.

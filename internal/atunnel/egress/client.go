@@ -40,6 +40,7 @@ type ClientConfig struct {
 	GatewayAddress       string
 	ServerName           string
 	GetClientCertificate func(*tls.CertificateRequestInfo) (*tls.Certificate, error)
+	GetConnectHeaders    func() (http.Header, error)
 	TrustBundlePath      string
 }
 
@@ -84,9 +85,10 @@ func withDialer(dial dialFunc) clientOption {
 
 // Client opens actor egress streams through an mTLS-authenticated gateway.
 type Client struct {
-	gatewayAddress string
-	tlsConfig      *tls.Config
-	dialContext    dialFunc
+	gatewayAddress    string
+	tlsConfig         *tls.Config
+	dialContext       dialFunc
+	getConnectHeaders func() (http.Header, error)
 
 	mu      sync.Mutex
 	closed  bool
@@ -121,8 +123,9 @@ func NewClient(cfg ClientConfig, opts ...clientOption) (*Client, error) {
 	}
 
 	client := &Client{
-		gatewayAddress: cfg.GatewayAddress,
-		dialContext:    (&net.Dialer{}).DialContext,
+		gatewayAddress:    cfg.GatewayAddress,
+		dialContext:       (&net.Dialer{}).DialContext,
+		getConnectHeaders: cfg.GetConnectHeaders,
 		tlsConfig: &tls.Config{
 			MinVersion:           tls.VersionTLS12,
 			RootCAs:              rootCAs,
@@ -415,6 +418,19 @@ func (c *Client) connectH1(tlsConn *tls.Conn, destination string) (net.Conn, err
 		Method: http.MethodConnect,
 		URL:    &url.URL{Host: destination},
 		Host:   destination,
+		Header: make(http.Header),
+	}
+	if c.getConnectHeaders != nil {
+		hdrs, err := c.getConnectHeaders()
+		if err != nil {
+			_ = tlsConn.Close()
+			return nil, fmt.Errorf("egress: get connect headers: %w", err)
+		}
+		for k, vv := range hdrs {
+			for _, v := range vv {
+				req.Header.Add(k, v)
+			}
+		}
 	}
 	if err := req.Write(tlsConn); err != nil {
 		_ = tlsConn.Close()
@@ -457,6 +473,21 @@ func (c *Client) connectH2(ctx context.Context, h2Conn *h2ClientConn, wasVerifie
 		Body:          reqBody,
 		ContentLength: -1,
 	}).WithContext(traceCtx)
+
+	if c.getConnectHeaders != nil {
+		hdrs, err := c.getConnectHeaders()
+		if err != nil {
+			stopCancel()
+			reqBody.abort()
+			streamCancel()
+			return nil, false, fmt.Errorf("egress: get connect headers: %w", err)
+		}
+		for k, vv := range hdrs {
+			for _, v := range vv {
+				req.Header.Add(k, v)
+			}
+		}
+	}
 
 	resp, err := h2Conn.cc.RoundTrip(req)
 	if !stopCancel() {
