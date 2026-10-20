@@ -288,3 +288,59 @@ func TestTheHostpathProxyIsNotPrivileged(t *testing.T) {
 		t.Fatal("csi-hostpath-testing.yaml no longer holds a proxy StatefulSet")
 	}
 }
+
+// The CSI controller Envoy proxies use the same digest-pinned Envoy image as
+// the dataplane image in cmd/dataplane/envoy/Dockerfile.
+func TestCSIEnvoySidecarsUseThePinnedDataplaneImage(t *testing.T) {
+	root := repoRoot(t)
+	dockerfile, err := os.ReadFile(filepath.Join(root, "cmd", "dataplane", "envoy", "Dockerfile"))
+	if err != nil {
+		t.Fatalf("reading dataplane Dockerfile: %v", err)
+	}
+	var wantImage string
+	for line := range strings.SplitSeq(string(dockerfile), "\n") {
+		if after, ok := strings.CutPrefix(strings.TrimSpace(line), "FROM envoyproxy/envoy:"); ok {
+			wantImage = "envoyproxy/envoy:" + strings.TrimSpace(after)
+		}
+	}
+	if wantImage == "" || !strings.Contains(wantImage, "@sha256:") {
+		t.Fatalf("cmd/dataplane/envoy/Dockerfile has no digest-pinned envoyproxy/envoy image (got %q)", wantImage)
+	}
+
+	var nfsPatch struct {
+		Spec struct {
+			Template struct {
+				Spec struct {
+					Containers []struct {
+						Name  string `json:"name"`
+						Image string `json:"image"`
+					} `json:"containers"`
+				} `json:"spec"`
+			} `json:"template"`
+		} `json:"spec"`
+	}
+	decodeYAML(t, "csiNFSControllerPatch", csiNFSControllerPatch, &nfsPatch)
+	var gotNFSPatch string
+	for _, c := range nfsPatch.Spec.Template.Spec.Containers {
+		if c.Name == "envoy" {
+			gotNFSPatch = c.Image
+		}
+	}
+	if gotNFSPatch != wantImage {
+		t.Errorf("csiNFSControllerPatch envoy image = %q, want %q", gotNFSPatch, wantImage)
+	}
+
+	for _, rel := range []string{
+		filepath.Join("hack", "setup-csi-nfs-kind.sh"),
+		filepath.Join("hack", "third_party", "csi-driver-host-path", "deploy", "csi-hostpath-testing.yaml"),
+		filepath.Join("docs", "csi-deployment.md"),
+	} {
+		data, err := os.ReadFile(filepath.Join(root, rel))
+		if err != nil {
+			t.Fatalf("reading %s: %v", rel, err)
+		}
+		if !strings.Contains(string(data), "image: "+wantImage) {
+			t.Errorf("%s does not pin the Envoy sidecar to %q", rel, wantImage)
+		}
+	}
+}
